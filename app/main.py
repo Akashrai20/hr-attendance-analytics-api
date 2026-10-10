@@ -187,16 +187,41 @@ def count_working_days(joined_on: str, month: str) -> int:
     return count
 
 
-def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Serialize MongoDB document to API response dict conforming to openapi.yaml."""
+def serialize_employee(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize MongoDB employee document strictly adhering to openapi.yaml Employee schema."""
     d = dict(doc)
     d.pop("_id", None)
     d.pop("id", None)
 
-    for field in ["punch_in", "punch_out", "created_at"]:
-        if field in d and d[field] is not None:
-            if isinstance(d[field], datetime):
-                d[field] = dt_to_epoch_ms(d[field])
+    created_at = d.get("created_at")
+    if created_at is not None and isinstance(created_at, datetime):
+        created_at = dt_to_epoch_ms(created_at)
+
+    return {
+        "emp_code": d.get("emp_code"),
+        "name": d.get("name"),
+        "email": d.get("email"),
+        "department": d.get("department"),
+        "shift_start": d.get("shift_start"),
+        "shift_end": d.get("shift_end"),
+        "joined_on": d.get("joined_on"),
+        "created_at": created_at,
+    }
+
+
+def serialize_attendance(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize MongoDB attendance document strictly adhering to openapi.yaml AttendanceRecord schema."""
+    d = dict(doc)
+    d.pop("_id", None)
+    d.pop("id", None)
+
+    punch_in = d.get("punch_in")
+    if punch_in is not None and isinstance(punch_in, datetime):
+        punch_in = dt_to_epoch_ms(punch_in)
+
+    punch_out = d.get("punch_out")
+    if punch_out is not None and isinstance(punch_out, datetime):
+        punch_out = dt_to_epoch_ms(punch_out)
 
     if "history" in d and d["history"]:
         serialized_hist = []
@@ -214,18 +239,26 @@ def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
                     changes_copy[ch_field] = c_dict
                 h_copy["changes"] = changes_copy
             serialized_hist.append(h_copy)
-        d["history"] = serialized_hist
+        serialized_history = serialized_hist
     else:
-        d["history"] = []
+        serialized_history = []
 
-    if "half_day" not in d or d["half_day"] is None:
-        d["half_day"] = False
-    if "overtime_minutes" not in d or d["overtime_minutes"] is None:
-        d["overtime_minutes"] = 0
-    if "late_minutes" not in d or d["late_minutes"] is None:
-        d["late_minutes"] = 0
+    return {
+        "emp_code": d.get("emp_code"),
+        "date": d.get("date"),
+        "status": d.get("status"),
+        "punch_in": punch_in,
+        "punch_out": punch_out,
+        "work_hours": d.get("work_hours"),
+        "late_minutes": d.get("late_minutes", 0) if d.get("late_minutes") is not None else 0,
+        "overtime_minutes": d.get("overtime_minutes", 0) if d.get("overtime_minutes") is not None else 0,
+        "half_day": bool(d.get("half_day", False)) if d.get("half_day") is not None else False,
+        "history": serialized_history,
+    }
 
-    return d
+
+# Backwards compatibility alias
+serialize_doc = serialize_attendance
 
 
 # --------------------------------------------------------------------------- #
@@ -308,7 +341,7 @@ def create_employee(body: EmployeeCreate):
     except DuplicateKeyError:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="emp_code already exists")
 
-    return serialize_doc(doc)
+    return serialize_employee(doc)
 
 
 @app.get("/employees", tags=["employees"])
@@ -325,7 +358,7 @@ def list_employees(
     total = db.employees.count_documents(q)
     skip = (page - 1) * page_size
     cursor = db.employees.find(q).sort("emp_code", ASCENDING).skip(skip).limit(page_size)
-    items = [serialize_doc(doc) for doc in cursor]
+    items = [serialize_employee(doc) for doc in cursor]
 
     return {
         "items": items,
@@ -1238,11 +1271,22 @@ def explain_endpoint(
         if emp_code:
             q["emp_code"] = emp_code
         if date_from or date_to:
-            q["date"] = {}
+            date_q: Dict[str, Any] = {}
             if date_from:
-                q["date"]["$gte"] = date_from
+                try:
+                    dt_date.fromisoformat(date_from)
+                except ValueError:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid date_from")
+                date_q["$gte"] = date_from
             if date_to:
-                q["date"]["$lte"] = date_to
+                try:
+                    dt_date.fromisoformat(date_to)
+                except ValueError:
+                    raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid date_to")
+                date_q["$lte"] = date_to
+            if date_from and date_to and date_from > date_to:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="date_from cannot be greater than date_to")
+            q["date"] = date_q
         if status_filter:
             q["status"] = status_filter
         skip = (page - 1) * page_size
@@ -1312,6 +1356,16 @@ def explain_endpoint(
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="department required")
         if not from_date or not to_date:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="from and to dates required")
+        try:
+            f_date = dt_date.fromisoformat(from_date)
+            t_date = dt_date.fromisoformat(to_date)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid date format")
+        if t_date < f_date:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="to date cannot be earlier than from date")
+        if (t_date - f_date).days + 1 > 92:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Date range cannot exceed 92 days")
+
         pipeline = build_department_trend_pipeline(department, from_date, to_date)
         explain_data = db.command(
             "explain",
